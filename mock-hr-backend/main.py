@@ -59,7 +59,7 @@ async def websocket_endpoint(client_ws: WebSocket):
 
     try:
         # Open a connection to OpenAI
-        async with websockets.connect(OPENAI_WS_URL, extra_headers=headers) as openai_ws:
+        async with websockets.connect(OPENAI_WS_URL, additional_headers=headers) as openai_ws:
             
             # Instantly inject the "Sarah" persona and configure the voice
             session_update = {

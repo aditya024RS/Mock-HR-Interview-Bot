@@ -10,7 +10,49 @@ export default function MockHRBot() {
   const [isConnected, setIsConnected] = useState(false);
   
   const wsRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioContextRef = useRef<any>(null);
+
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef(0);
+
+  const playAudioChunk = async (base64Audio: string) => {
+    // Initialize the playback context on the first run (Gemini outputs 24kHz audio)
+    if (!playbackContextRef.current) {
+      playbackContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    }
+    const ctx = playbackContextRef.current;
+
+    // Decode Base64 string to raw binary
+    const binaryString = atob(base64Audio);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    // Convert 16-bit PCM binary back to Float32 for the Web Audio API
+    const int16Array = new Int16Array(bytes.buffer);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
+    }
+
+    // Create an audio buffer and load the data
+    const buffer = ctx.createBuffer(1, float32Array.length, 24000);
+    buffer.getChannelData(0).set(float32Array);
+
+    // Create a source node and connect it to the speakers
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+
+    // Schedule the audio to play exactly when the last chunk finishes
+    const currentTime = ctx.currentTime;
+    if (nextPlayTimeRef.current < currentTime) {
+      nextPlayTimeRef.current = currentTime;
+    }
+    source.start(nextPlayTimeRef.current);
+    nextPlayTimeRef.current += buffer.duration;
+  };
 
   // Initialize WebSocket Connection
   useEffect(() => {
@@ -24,7 +66,7 @@ export default function MockHRBot() {
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      // OpenAI Realtime API sends events like 'response.audio_transcript.delta'
+      // Gemini Realtime API sends events like 'response.audio_transcript.delta'
       if (data.type === "response.audio_transcript.delta") {
         setMessages((prev) => {
           const lastMsg = prev[prev.length - 1];
@@ -37,6 +79,9 @@ export default function MockHRBot() {
       }
       
       // Note: Audio playback logic for 'response.audio.delta' would hook into an AudioContext here.
+      if (data.type === "response.audio.delta") {
+        playAudioChunk(data.delta);
+      }
     };
 
     ws.onclose = () => setIsConnected(false);
@@ -45,25 +90,50 @@ export default function MockHRBot() {
     return () => ws.close();
   }, []);
 
-  // Handle Microphone Access and Streaming
+  // Handle Microphone Access and Raw PCM Streaming
   const toggleRecording = async () => {
     if (isRecording) {
-      mediaRecorderRef.current?.stop();
+      if (audioContextRef.current) {
+        // Clean up the audio nodes to free memory
+        const { stream, audioContext, processor, gainNode } = audioContextRef.current;
+        processor.disconnect();
+        gainNode.disconnect();
+        audioContext.close();
+        stream.getTracks().forEach((track: any) => track.stop());
+        audioContextRef.current = null;
+      }
       setIsRecording(false);
-      // Send a commit event to OpenAI telling it we stopped talking
-      wsRef.current?.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      wsRef.current?.send(JSON.stringify({ type: "response.create" }));
     } else {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const mediaRecorder = new MediaRecorder(stream);
         
-        mediaRecorder.ondataavailable = async (event) => {
-          if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-            // Convert audio blob to base64 for OpenAI
-            const buffer = await event.data.arrayBuffer();
-            const base64Audio = Buffer.from(buffer).toString('base64');
+        // Force exactly 16kHz sample rate for the Gemini Live API
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        
+        // Create a script processor to capture raw audio data (buffer size 4096, 1 input channel, 1 output channel)
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (event) => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            const inputData = event.inputBuffer.getChannelData(0);
             
+            // Convert Float32 audio to Int16 PCM (The exact format Gemini requires)
+            const pcmData = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+              let s = Math.max(-1, Math.min(1, inputData[i]));
+              pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            
+            // Fast conversion from PCM Int16Array to Base64
+            const uint8 = new Uint8Array(pcmData.buffer);
+            let binary = '';
+            for (let i = 0; i < uint8.byteLength; i++) {
+              binary += String.fromCharCode(uint8[i]);
+            }
+            const base64Audio = btoa(binary);
+
+            // Stream directly to our Python backend
             wsRef.current.send(JSON.stringify({
               type: "input_audio_buffer.append",
               audio: base64Audio
@@ -71,9 +141,15 @@ export default function MockHRBot() {
           }
         };
 
-        // Capture audio in 250ms chunks for low latency
-        mediaRecorder.start(250);
-        mediaRecorderRef.current = mediaRecorder;
+        source.connect(processor);
+        
+        // Connect to a dummy gain node to prevent awful audio feedback loop
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = 0;
+        processor.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        audioContextRef.current = { stream, audioContext, processor, gainNode };
         setIsRecording(true);
       } catch (error) {
         console.error("Microphone access denied:", error);

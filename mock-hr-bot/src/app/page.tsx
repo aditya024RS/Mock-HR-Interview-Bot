@@ -4,9 +4,18 @@ import React, { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { Mic, MicOff, MessageSquare, Activity } from "lucide-react";
 
+// Extend the Window interface to include the experimental Web Speech API
+declare global {
+  interface Window {
+    SpeechRecognition: any;
+    webkitSpeechRecognition: any;
+  }
+}
+
 export default function MockHRBot() {
   const [isRecording, setIsRecording] = useState(false);
   const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   
   const wsRef = useRef<WebSocket | null>(null);
@@ -14,6 +23,8 @@ export default function MockHRBot() {
 
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef(0);
+
+  const speechRecognitionRef = useRef<any>(null);
 
   const playAudioChunk = async (base64Audio: string) => {
     // Initialize the playback context on the first run (Gemini outputs 24kHz audio)
@@ -90,7 +101,7 @@ export default function MockHRBot() {
     return () => ws.close();
   }, []);
 
-  // Handle Microphone Access and Raw PCM Streaming
+  // Handle Microphone Access and Raw PCM Streaming, and Local Transcription
   const toggleRecording = async () => {
     if (isRecording) {
       if (audioContextRef.current) {
@@ -102,12 +113,46 @@ export default function MockHRBot() {
         stream.getTracks().forEach((track: any) => track.stop());
         audioContextRef.current = null;
       }
+
+      // Stop the local transcriber
+      if (speechRecognitionRef.current) {
+        speechRecognitionRef.current.stop();
+      }
+
+      // Commit the live transcript to the actual chat history
+      setLiveTranscript((currentTranscript) => {
+        if (currentTranscript.trim()) {
+          setMessages((prev) => [...prev, { role: "user", content: currentTranscript }]);
+        }
+        return ""; // Clear it out for the next time
+      });
+
       setIsRecording(false);
     } else {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // --- 1. FIRE UP LOCAL SPEECH-TO-TEXT FOR USER CHAT BUBBLE ---
+        const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (SpeechRecognition) {
+          const recognition = new SpeechRecognition();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          
+          recognition.onresult = (event: any) => {
+            let finalTranscript = '';
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+              finalTranscript += event.results[i][0].transcript;
+            }
+            // Update the temporary live transcript
+            setLiveTranscript(finalTranscript);
+          };
+          
+          recognition.start();
+          speechRecognitionRef.current = recognition;
+        }
         
-        // Force exactly 16kHz sample rate for the Gemini Live API
+        // --- 2. THE PCM ENCODER FOR GEMINI ---
         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         const source = audioContext.createMediaStreamSource(stream);
         
@@ -156,7 +201,7 @@ export default function MockHRBot() {
       }
     }
   };
-
+ 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col items-center p-6 font-sans">
       
@@ -195,11 +240,27 @@ export default function MockHRBot() {
                   : "bg-gray-800 text-gray-200 border border-gray-700"
               }`}>
                 {msg.role === "assistant" && <p className="text-xs text-emerald-400 font-bold mb-1 tracking-wider uppercase">Sarah (HR)</p>}
-                <p className="leading-relaxed">{msg.content}</p>
+                {/* The Regex Shield: Instantly deletes anything wrapped in **asterisks** */}
+                <p className="leading-relaxed">
+                  {msg.content.replace(/\*\*.*?\*\*/g, '').trim()}
+                </p>
               </div>
             </motion.div>
           ))
         )}
+
+        {/* Render the Live User Transcript Bubble */}
+        {isRecording && liveTranscript && (
+          <motion.div 
+            initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+            className="mb-6 flex justify-end"
+          >
+            <div className="max-w-[80%] rounded-2xl p-4 bg-emerald-600/50 text-white border border-emerald-500 border-dashed">
+              <p className="leading-relaxed">{liveTranscript} <span className="animate-pulse">...</span></p>
+            </div>
+          </motion.div>
+        )}
+
       </div>
 
       {/* Controls Container */}

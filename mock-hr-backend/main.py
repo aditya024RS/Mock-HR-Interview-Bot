@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 import random
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import websockets
 from dotenv import load_dotenv
+from google import genai
 
 # Load your secret keys from the .env file
 load_dotenv()
@@ -13,6 +15,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # This is Gemini's dedicated Realtime WebSocket endpoint
 GEMINI_WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
+
+# Configure the Gemini SDK for the scoring endpoint
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI()
 
@@ -36,14 +41,96 @@ INTERVIEW_THEMES = [
     "failing at a major task and how they recovered",
     "taking the initiative on a project without being asked",
     "adapting to a sudden change in project requirements",
-    "explaining a complex technical concept to a non-technical person"
+    "explaining a complex technical concept to a non-technical person",
+    "leading a team through a challenging situation",
+    "receiving critical feedback and improving from it",
+    "making a difficult decision with incomplete information",
+    "mentoring or helping a struggling team member"
 ]
+
+# ---------------------------------------------------------
+# REST Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/themes")
+async def get_themes():
+    """Returns the list of available interview themes for the frontend selector."""
+    return {"themes": INTERVIEW_THEMES}
+
+
+class ScoreRequest(BaseModel):
+    transcript: str
+
+
+@app.post("/api/score")
+async def score_interview(req: ScoreRequest):
+    """
+    Accepts a full interview transcript and uses Gemini to generate
+    a structured post-interview scorecard with STAR analysis.
+    """
+    scoring_prompt = f"""You are an expert HR interview evaluator. Analyze the following mock interview transcript between an interviewer (Sarah) and a candidate.
+
+For each question-answer pair in the transcript, evaluate:
+1. **STAR Structure** (rate 1-5): Did the candidate provide a clear Situation, Task, Action, and Result?
+2. **Delivery Quality** (rate 1-5): Was the answer clear, concise, confident, and well-paced?
+3. **Feedback**: A brief 1-sentence note about that specific answer.
+
+Also provide:
+- An **overall_score** (1-100) summarizing the entire interview performance.
+- A list of exactly 3 **areas_to_improve** (short, actionable bullet points).
+- A list of exactly 2 **strengths** (short, specific bullet points about what they did well).
+
+Return your response as valid JSON matching this exact schema (no markdown, no code fences, just raw JSON):
+{{
+  "overall_score": <number 1-100>,
+  "questions": [
+    {{
+      "question": "<the question Sarah asked>",
+      "star_score": <1-5>,
+      "delivery_score": <1-5>,
+      "feedback": "<1 sentence>"
+    }}
+  ],
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "areas_to_improve": ["<area 1>", "<area 2>", "<area 3>"]
+}}
+
+--- TRANSCRIPT ---
+{req.transcript}
+--- END TRANSCRIPT ---
+"""
+    try:
+        response = genai_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=scoring_prompt
+        )
+        
+        # Parse the JSON response from Gemini
+        response_text = response.text.strip()
+        # Strip markdown code fences if Gemini adds them despite instructions
+        if response_text.startswith("```"):
+            response_text = response_text.split("\n", 1)[1]
+        if response_text.endswith("```"):
+            response_text = response_text.rsplit("```", 1)[0]
+        response_text = response_text.strip()
+        
+        score_data = json.loads(response_text)
+        return score_data
+    except Exception as e:
+        print(f"Scoring Error: {e}")
+        # Return a fallback structure so the frontend doesn't break
+        return {
+            "overall_score": 0,
+            "questions": [],
+            "strengths": ["Unable to generate scores at this time."],
+            "areas_to_improve": ["Please try again later."],
+            "error": str(e)
+        }
+
 
 # ---------------------------------------------------------
 # The Master Persona Prompt 
 # ---------------------------------------------------------
-# Randomly select a theme for this specific interview session
-current_theme = random.choice(INTERVIEW_THEMES)
 
 SYSTEM_PROMPT = """
 You are "Sarah", a Senior Technical HR Manager at a top-tier tech company called PlaceMate. You are conducting a live, real-time audio behavioral mock interview. Your sole purpose is to help the candidate sharpen their communication skills, structure their answers, and build interview confidence.
@@ -120,9 +207,18 @@ When you notice a delivery issue, address it gently and constructively. For exam
 # The Gemini WebSocket Bridge 
 # ---------------------------------------------------------
 @app.websocket("/ws/chat")
-async def websocket_endpoint(client_ws: WebSocket):
+async def websocket_endpoint(client_ws: WebSocket, theme: str = Query(default=None)):
     # Accept the connection from your React frontend
     await client_ws.accept()
+
+    # Select theme: use client-provided theme or pick randomly
+    if theme and theme != "random":
+        current_theme = theme
+    else:
+        current_theme = random.choice(INTERVIEW_THEMES)
+
+    # Inject the selected theme into the system prompt
+    prompt_with_theme = SYSTEM_PROMPT.replace("{current_theme}", current_theme)
 
     try:
         async with websockets.connect(GEMINI_WS_URL) as gemini_ws:
@@ -132,7 +228,7 @@ async def websocket_endpoint(client_ws: WebSocket):
                 "setup": {
                     "model": "models/gemini-2.5-flash-native-audio-preview-12-2025",
                     "systemInstruction": {
-                        "parts": [{"text": SYSTEM_PROMPT}]
+                        "parts": [{"text": prompt_with_theme}]
                     },
                     "generationConfig": {
                         # Strictly AUDIO only. Gemini attaches transcripts automatically.
@@ -169,7 +265,7 @@ async def websocket_endpoint(client_ws: WebSocket):
                         data_str = await client_ws.receive_text()
                         data = json.loads(data_str)
                         
-                        # Updated to the new v1alpha realtimeInput schema
+                        # Handle raw audio streaming
                         if data.get("type") == "input_audio_buffer.append":
                             gemini_audio = {
                                 "realtimeInput": {
@@ -180,6 +276,19 @@ async def websocket_endpoint(client_ws: WebSocket):
                                 }
                             }
                             await gemini_ws.send(json.dumps(gemini_audio))
+                        
+                        # Handle skip question command from UI button
+                        elif data.get("type") == "skip_question":
+                            skip_message = {
+                                "clientContent": {
+                                    "turns": [{
+                                        "role": "user",
+                                        "parts": [{"text": "Skip this question please. I'd like to move on to a different topic."}]
+                                    }],
+                                    "turnComplete": True
+                                }
+                            }
+                            await gemini_ws.send(json.dumps(skip_message))
                             
                 except WebSocketDisconnect:
                     print("React client disconnected.")
@@ -192,7 +301,8 @@ async def websocket_endpoint(client_ws: WebSocket):
                         message = json.loads(message_str)
                         
                         if "serverContent" in message:
-                            model_turn = message["serverContent"].get("modelTurn")
+                            server_content = message["serverContent"]
+                            model_turn = server_content.get("modelTurn")
                             
                             if model_turn:
                                 for part in model_turn.get("parts", []):
@@ -212,6 +322,12 @@ async def websocket_endpoint(client_ws: WebSocket):
                                         }
                                         await client_ws.send_text(json.dumps(react_text))
 
+                            # Forward turnComplete so the frontend knows Sarah finished speaking
+                            if server_content.get("turnComplete"):
+                                await client_ws.send_text(json.dumps({
+                                    "type": "response.done"
+                                }))
+
                 except websockets.exceptions.ConnectionClosed:
                     print("Gemini connection closed.")
 
@@ -219,6 +335,8 @@ async def websocket_endpoint(client_ws: WebSocket):
             await asyncio.gather(forward_to_gemini(), forward_to_client())
 
     except Exception as e:
-        print(f"Connection Logic Error: {e}") 
-        await client_ws.close()
-        
+        print(f"Connection Logic Error: {e}")
+        try:
+            await client_ws.close()
+        except RuntimeError:
+            pass  # Already closed

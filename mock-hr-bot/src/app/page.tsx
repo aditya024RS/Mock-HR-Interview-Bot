@@ -1,8 +1,10 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { motion } from "framer-motion";
-import { Mic, MicOff, MessageSquare, Activity } from "lucide-react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import OnboardingScreen from "./components/OnboardingScreen";
+import InterviewScreen from "./components/InterviewScreen";
+import ScorecardScreen from "./components/ScorecardScreen";
+import SessionHistoryDrawer from "./components/SessionHistoryDrawer";
 
 // Extend the Window interface to include the experimental Web Speech API
 declare global {
@@ -12,73 +14,134 @@ declare global {
   }
 }
 
+type Phase = "onboarding" | "interview" | "scorecard";
+
+const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/chat";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function MockHRBot() {
-  const [isRecording, setIsRecording] = useState(false);
+  // ----- Phase Management -----
+  const [phase, setPhase] = useState<Phase>("onboarding");
+
+  // ----- Onboarding State -----
+  const [themes, setThemes] = useState<string[]>([]);
+  const [selectedTheme, setSelectedTheme] = useState("random");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [hasHistory, setHasHistory] = useState(false);
+
+  // ----- Interview State -----
   const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
   const [liveTranscript, setLiveTranscript] = useState("");
   const [isConnected, setIsConnected] = useState(false);
-  
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<any>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isSarahThinking, setIsSarahThinking] = useState(false);
+  const [isSarahSpeaking, setIsSarahSpeaking] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
+  const [questionCount, setQuestionCount] = useState(0);
 
+  // ----- Reconnection State (Feature #7) -----
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectAttemptsRef = useRef(0);
+  const maxReconnectAttempts = 3;
+
+  // ----- Refs -----
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<{
+    stream: MediaStream;
+    audioContext: AudioContext;
+    processor: ScriptProcessorNode;
+    gainNode: GainNode;
+  } | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef(0);
-
   const speechRecognitionRef = useRef<any>(null);
+  const userStoppedSpeakingRef = useRef(false);
 
-  const playAudioChunk = async (base64Audio: string) => {
-    // Initialize the playback context on the first run (Gemini outputs 24kHz audio)
+  // ----- Fetch Themes on Mount -----
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/api/themes`)
+      .then((res) => res.json())
+      .then((data) => setThemes(data.themes || []))
+      .catch(() => {
+        // Fallback themes if API is down
+        setThemes([
+          "handling a tight deadline under pressure",
+          "dealing with a difficult coworker or team conflict",
+          "failing at a major task and how they recovered",
+        ]);
+      });
+
+    // Check if there are past sessions
+    const stored = localStorage.getItem("placemate_sessions");
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        setHasHistory(parsed.length > 0);
+      } catch {
+        setHasHistory(false);
+      }
+    }
+  }, []);
+
+  // ----- Audio Playback -----
+  const playAudioChunk = useCallback(async (base64Audio: string) => {
     if (!playbackContextRef.current) {
-      playbackContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      playbackContextRef.current = new (window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({
+        sampleRate: 24000,
+      });
     }
     const ctx = playbackContextRef.current;
 
-    // Decode Base64 string to raw binary
     const binaryString = atob(base64Audio);
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
-    
-    // Convert 16-bit PCM binary back to Float32 for the Web Audio API
+
     const int16Array = new Int16Array(bytes.buffer);
     const float32Array = new Float32Array(int16Array.length);
     for (let i = 0; i < int16Array.length; i++) {
       float32Array[i] = int16Array[i] / 32768.0;
     }
 
-    // Create an audio buffer and load the data
     const buffer = ctx.createBuffer(1, float32Array.length, 24000);
     buffer.getChannelData(0).set(float32Array);
 
-    // Create a source node and connect it to the speakers
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
 
-    // Schedule the audio to play exactly when the last chunk finishes
     const currentTime = ctx.currentTime;
     if (nextPlayTimeRef.current < currentTime) {
       nextPlayTimeRef.current = currentTime;
     }
     source.start(nextPlayTimeRef.current);
     nextPlayTimeRef.current += buffer.duration;
-  };
+  }, []);
 
-  // Initialize WebSocket Connection
-  useEffect(() => {
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/chat";
-    const ws = new WebSocket(wsUrl);
+  // ----- WebSocket Connection -----
+  const connectWebSocket = useCallback(() => {
+    const themeParam = selectedTheme !== "random" ? `?theme=${encodeURIComponent(selectedTheme)}` : "";
+    const ws = new WebSocket(`${WS_BASE_URL}${themeParam}`);
 
     ws.onopen = () => {
       console.log("Connected to Python Backend");
       setIsConnected(true);
+      setReconnecting(false);
+      reconnectAttemptsRef.current = 0;
     };
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      // Gemini Realtime API sends events like 'response.audio_transcript.delta'
+
       if (data.type === "response.audio_transcript.delta") {
+        // Start the timer on first Sarah message
+        setSessionStartTime((prev) => prev || Date.now());
+        setIsSarahThinking(false);
+        setIsSarahSpeaking(true);
+
         setMessages((prev) => {
           const lastMsg = prev[prev.length - 1];
           if (lastMsg && lastMsg.role === "assistant") {
@@ -88,107 +151,204 @@ export default function MockHRBot() {
           return [...prev, { role: "assistant", content: data.delta }];
         });
       }
-      
-      // Note: Audio playback logic for 'response.audio.delta' would hook into an AudioContext here.
+
       if (data.type === "response.audio.delta") {
+        setIsSarahSpeaking(true);
         playAudioChunk(data.delta);
+      }
+
+      if (data.type === "response.done") {
+        setIsSarahSpeaking(false);
+        // Update question count — count assistant messages containing "?"
+        setMessages((prev) => {
+          const count = prev.filter(
+            (m) => m.role === "assistant" && m.content.includes("?")
+          ).length;
+          setQuestionCount(count);
+          return prev;
+        });
       }
     };
 
-    ws.onclose = () => setIsConnected(false);
-    wsRef.current = ws;
+    ws.onclose = () => {
+      setIsConnected(false);
+      setIsSarahSpeaking(false);
 
-    return () => ws.close();
+      // Reconnection logic (Feature #7)
+      if (phase === "interview" && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        setReconnecting(true);
+        const delay = Math.pow(2, reconnectAttemptsRef.current) * 1000; // 1s, 2s, 4s
+        reconnectAttemptsRef.current += 1;
+        console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current})`);
+
+        setTimeout(() => {
+          // Save messages to sessionStorage before reconnecting
+          sessionStorage.setItem("placemate_messages", JSON.stringify(messages));
+          connectWebSocket();
+        }, delay);
+      } else if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
+        setReconnecting(false);
+      }
+    };
+
+    ws.onerror = () => {
+      console.error("WebSocket error");
+    };
+
+    wsRef.current = ws;
+  }, [selectedTheme, phase, playAudioChunk, messages]);
+
+  // ----- Start Interview -----
+  const startInterview = useCallback(() => {
+    setPhase("interview");
+    setMessages([]);
+    setLiveTranscript("");
+    setSessionStartTime(null);
+    setQuestionCount(0);
+    setIsSarahThinking(true); // Show thinking while waiting for greeting
+    connectWebSocket();
+  }, [connectWebSocket]);
+
+  // ----- End Interview -----
+  const endInterview = useCallback(() => {
+    // Stop recording if active
+    if (audioContextRef.current) {
+      const { stream, audioContext, processor, gainNode } = audioContextRef.current;
+      processor.disconnect();
+      gainNode.disconnect();
+      audioContext.close();
+      stream.getTracks().forEach((track) => track.stop());
+      audioContextRef.current = null;
+    }
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.stop();
+    }
+    setIsRecording(false);
+
+    // Close WebSocket
+    if (wsRef.current) {
+      reconnectAttemptsRef.current = maxReconnectAttempts; // Prevent reconnection
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    setPhase("scorecard");
   }, []);
 
-  // Handle Microphone Access and Raw PCM Streaming, and Local Transcription
-  const toggleRecording = async () => {
+  // ----- Restart (back to onboarding) -----
+  const restartInterview = useCallback(() => {
+    setPhase("onboarding");
+    setMessages([]);
+    setLiveTranscript("");
+    setSessionStartTime(null);
+    setQuestionCount(0);
+    setIsConnected(false);
+    setIsSarahThinking(false);
+    setIsSarahSpeaking(false);
+    setSelectedTheme("random");
+    setHasHistory(true); // We just finished a session
+    reconnectAttemptsRef.current = 0;
+  }, []);
+
+  // ----- Toggle Recording -----
+  const toggleRecording = useCallback(async () => {
     if (isRecording) {
+      // Stop recording
       if (audioContextRef.current) {
-        // Clean up the audio nodes to free memory
         const { stream, audioContext, processor, gainNode } = audioContextRef.current;
         processor.disconnect();
         gainNode.disconnect();
         audioContext.close();
-        stream.getTracks().forEach((track: any) => track.stop());
+        stream.getTracks().forEach((track) => track.stop());
         audioContextRef.current = null;
       }
 
-      // Stop the local transcriber
       if (speechRecognitionRef.current) {
         speechRecognitionRef.current.stop();
       }
 
-      // Commit the live transcript to the actual chat history
+      // Commit live transcript to chat
       setLiveTranscript((currentTranscript) => {
         if (currentTranscript.trim()) {
           setMessages((prev) => [...prev, { role: "user", content: currentTranscript }]);
         }
-        return ""; // Clear it out for the next time
+        return "";
       });
 
       setIsRecording(false);
+      setAudioLevel(0);
+      // Mark that user stopped speaking -> Sarah should be thinking
+      userStoppedSpeakingRef.current = true;
+      setIsSarahThinking(true);
     } else {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        // --- 1. FIRE UP LOCAL SPEECH-TO-TEXT FOR USER CHAT BUBBLE ---
-        const SpeechRecognition = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
-        if (SpeechRecognition) {
-          const recognition = new SpeechRecognition();
+        // 1. Local Speech-to-Text for user chat bubble
+        const SpeechRecognitionAPI =
+          window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognitionAPI) {
+          const recognition = new SpeechRecognitionAPI();
           recognition.continuous = true;
           recognition.interimResults = true;
-          
+
           recognition.onresult = (event: any) => {
-            let finalTranscript = '';
+            let finalTranscript = "";
             for (let i = event.resultIndex; i < event.results.length; ++i) {
               finalTranscript += event.results[i][0].transcript;
             }
-            // Update the temporary live transcript
             setLiveTranscript(finalTranscript);
           };
-          
+
           recognition.start();
           speechRecognitionRef.current = recognition;
         }
-        
-        // --- 2. THE PCM ENCODER FOR GEMINI ---
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+
+        // 2. PCM Encoder for Gemini
+        const audioContext = new (window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({
+          sampleRate: 16000,
+        });
         const source = audioContext.createMediaStreamSource(stream);
-        
-        // Create a script processor to capture raw audio data (buffer size 4096, 1 input channel, 1 output channel)
         const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
         processor.onaudioprocess = (event) => {
           if (wsRef.current?.readyState === WebSocket.OPEN) {
             const inputData = event.inputBuffer.getChannelData(0);
-            
-            // Convert Float32 audio to Int16 PCM (The exact format Gemini requires)
+
+            // Compute RMS audio level for waveform visualizer (Feature #2)
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) {
+              sum += inputData[i] * inputData[i];
+            }
+            const rms = Math.sqrt(sum / inputData.length);
+            setAudioLevel(Math.min(1, rms * 5)); // Amplify for visual effect
+
+            // Convert Float32 → Int16 PCM
             const pcmData = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
-              let s = Math.max(-1, Math.min(1, inputData[i]));
-              pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              const s = Math.max(-1, Math.min(1, inputData[i]));
+              pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
             }
-            
-            // Fast conversion from PCM Int16Array to Base64
+
+            // Int16Array → Base64
             const uint8 = new Uint8Array(pcmData.buffer);
-            let binary = '';
+            let binary = "";
             for (let i = 0; i < uint8.byteLength; i++) {
               binary += String.fromCharCode(uint8[i]);
             }
             const base64Audio = btoa(binary);
 
-            // Stream directly to our Python backend
-            wsRef.current.send(JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: base64Audio
-            }));
+            wsRef.current.send(
+              JSON.stringify({
+                type: "input_audio_buffer.append",
+                audio: base64Audio,
+              })
+            );
           }
         };
 
         source.connect(processor);
-        
-        // Connect to a dummy gain node to prevent awful audio feedback loop
         const gainNode = audioContext.createGain();
         gainNode.gain.value = 0;
         processor.connect(gainNode);
@@ -196,102 +356,117 @@ export default function MockHRBot() {
 
         audioContextRef.current = { stream, audioContext, processor, gainNode };
         setIsRecording(true);
+        userStoppedSpeakingRef.current = false;
+        setIsSarahThinking(false);
       } catch (error) {
         console.error("Microphone access denied:", error);
       }
     }
-  };
- 
+  }, [isRecording]);
+
+  // ----- Skip Question -----
+  const skipQuestion = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "skip_question" }));
+      setMessages((prev) => [...prev, { role: "user", content: "(Skipped question)" }]);
+      setIsSarahThinking(true);
+    }
+  }, []);
+
+  // ----- Cleanup on Unmount -----
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        reconnectAttemptsRef.current = maxReconnectAttempts;
+        wsRef.current.close();
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.processor.disconnect();
+        audioContextRef.current.gainNode.disconnect();
+        audioContextRef.current.audioContext.close();
+        audioContextRef.current.stream.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
+
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col items-center p-6 font-sans">
-      
-      {/* Header */}
-      <header className="w-full max-w-3xl flex justify-between items-center mb-8 border-b border-gray-800 pb-4">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-gray-800 rounded-lg">
-            <MessageSquare size={24} className="text-emerald-500" />
-          </div>
-          <h1 className="text-xl font-semibold tracking-tight">PlaceMate AI Interviewer</h1>
+    <>
+      {/* Reconnection Banner (Feature #7) */}
+      {reconnecting && (
+        <div className="reconnect-banner fixed top-0 left-0 right-0 z-50 bg-amber-500/20 border-b border-amber-500/30 px-4 py-2.5 text-center">
+          <p className="text-sm text-amber-300 flex items-center justify-center gap-2">
+            <span className="animate-spin w-3.5 h-3.5 border-2 border-amber-400 border-t-transparent rounded-full inline-block" />
+            Connection lost. Reconnecting... (attempt{" "}
+            {reconnectAttemptsRef.current}/{maxReconnectAttempts})
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-sm text-gray-400">System Status</span>
-          <div className={`w-3 h-3 rounded-full ${isConnected ? "bg-emerald-500" : "bg-red-500"}`} />
-        </div>
-      </header>
+      )}
 
-      {/* Chat Log Window */}
-      <div className="flex-1 w-full max-w-3xl bg-gray-900 border border-gray-800 rounded-xl p-6 overflow-y-auto mb-6 shadow-xl">
-        {messages.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-gray-500 gap-4">
-            <Activity size={48} className="opacity-20" />
-            <p>Waiting to start interview...</p>
+      {/* Connection Failed Banner */}
+      {!isConnected &&
+        !reconnecting &&
+        phase === "interview" &&
+        reconnectAttemptsRef.current >= maxReconnectAttempts && (
+          <div className="reconnect-banner fixed top-0 left-0 right-0 z-50 bg-red-500/20 border-b border-red-500/30 px-4 py-2.5 text-center">
+            <p className="text-sm text-red-300 flex items-center justify-center gap-3">
+              Connection failed.
+              <button
+                onClick={() => {
+                  reconnectAttemptsRef.current = 0;
+                  connectWebSocket();
+                }}
+                className="px-3 py-1 bg-red-500/30 hover:bg-red-500/50 rounded-lg text-xs font-semibold transition-colors"
+              >
+                Restart Connection
+              </button>
+            </p>
           </div>
-        ) : (
-          messages.map((msg, index) => (
-            <motion.div 
-              key={index}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className={`mb-6 flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div className={`max-w-[80%] rounded-2xl p-4 ${
-                msg.role === "user" 
-                  ? "bg-emerald-600 text-white" 
-                  : "bg-gray-800 text-gray-200 border border-gray-700"
-              }`}>
-                {msg.role === "assistant" && <p className="text-xs text-emerald-400 font-bold mb-1 tracking-wider uppercase">Sarah (HR)</p>}
-                {/* The Regex Shield: Instantly deletes anything wrapped in **asterisks** */}
-                <p className="leading-relaxed">
-                  {msg.content.replace(/\*\*.*?\*\*/g, '').trim()}
-                </p>
-              </div>
-            </motion.div>
-          ))
         )}
 
-        {/* Render the Live User Transcript Bubble */}
-        {isRecording && liveTranscript && (
-          <motion.div 
-            initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
-            className="mb-6 flex justify-end"
-          >
-            <div className="max-w-[80%] rounded-2xl p-4 bg-emerald-600/50 text-white border border-emerald-500 border-dashed">
-              <p className="leading-relaxed">{liveTranscript} <span className="animate-pulse">...</span></p>
-            </div>
-          </motion.div>
-        )}
+      {/* Phase Router */}
+      {phase === "onboarding" && (
+        <OnboardingScreen
+          themes={themes}
+          selectedTheme={selectedTheme}
+          onThemeSelect={setSelectedTheme}
+          onStartInterview={startInterview}
+          onOpenHistory={() => setHistoryOpen(true)}
+          hasHistory={hasHistory}
+        />
+      )}
 
-      </div>
+      {phase === "interview" && (
+        <InterviewScreen
+          messages={messages}
+          liveTranscript={liveTranscript}
+          isRecording={isRecording}
+          isConnected={isConnected}
+          isSarahThinking={isSarahThinking}
+          isSarahSpeaking={isSarahSpeaking}
+          audioLevel={audioLevel}
+          sessionStartTime={sessionStartTime}
+          questionCount={questionCount}
+          onToggleRecording={toggleRecording}
+          onSkipQuestion={skipQuestion}
+          onEndInterview={endInterview}
+        />
+      )}
 
-      {/* Controls Container */}
-      <div className="w-full max-w-3xl flex justify-center pb-6">
-        <button
-          onClick={toggleRecording}
-          disabled={!isConnected}
-          className={`flex items-center gap-3 px-8 py-4 rounded-full font-semibold transition-all duration-200 shadow-lg ${
-            !isConnected 
-              ? "bg-gray-800 text-gray-500 cursor-not-allowed"
-              : isRecording
-                ? "bg-emerald-500 text-gray-950 hover:bg-emerald-400 ring-4 ring-emerald-500/30"
-                : "bg-gray-800 hover:bg-gray-700 text-white border border-gray-700"
-          }`}
-        >
-          {isRecording ? (
-            <>
-              <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 1.5 }}>
-                <Mic size={24} />
-              </motion.div>
-              Recording Answer...
-            </>
-          ) : (
-            <>
-              <MicOff size={24} />
-              Hold to Speak
-            </>
-          )}
-        </button>
-      </div>
-      
-    </div>
+      {phase === "scorecard" && (
+        <ScorecardScreen
+          messages={messages}
+          sessionStartTime={sessionStartTime}
+          selectedTheme={selectedTheme}
+          onRestart={restartInterview}
+          backendUrl={WS_BASE_URL}
+        />
+      )}
+
+      {/* Session History Drawer (accessible from onboarding) */}
+      <SessionHistoryDrawer
+        isOpen={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+      />
+    </>
   );
 }
